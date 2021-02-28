@@ -1,0 +1,188 @@
+#include <esp_pm.h>
+#include <esp_http_client.h>
+#include "Arduino.h"
+#include "Wire.h"
+#include "BitBang_I2C.h"
+#include "WiFi.h"
+#include "WiFiConfig.h"
+
+#define SENSOR_ADDR 0x44
+#define SLEEP_SECONDS (120)
+#define DEBUG
+
+#ifdef DEBUG
+#define debugln(a) Serial.println(a);
+#define debug(a) Serial.print(a);
+#else
+#define debugln(a) ;
+#define debug(a) ;
+#endif
+
+BBI2C bbi2c;
+static float temperature = -1.0f;
+static float humidity = -1.0f;
+unsigned long startupTime = -1;
+
+void initSensor();
+
+void startConnectingToWifi();
+
+void readDataFromSensor();
+
+void waitForWifi();
+
+void doDeepSleep();
+
+void setup() {
+
+#ifdef DEBUG
+    Serial.begin(115200);
+    while (!Serial) { ; // wait for serial port to connect. Needed for native USB port only
+    }
+#endif
+
+    startupTime = millis();
+
+    esp_pm_config_esp32s2_t pm_config = {
+            .max_freq_mhz = ESP_PM_CPU_FREQ_MAX,
+            .min_freq_mhz = 40,
+            .light_sleep_enable = true
+    };
+    esp_err_t err = esp_pm_configure(&pm_config);
+    if(err == ESP_ERR_NOT_SUPPORTED) {
+        debugln("Light sleep configuration said: ESP_ERR_NOT_SUPPORTED");
+    }
+    if(err == ESP_ERR_INVALID_ARG) {
+        debugln("Light sleep configuration said: ESP_ERR_INVALID_ARG");
+    }
+
+}
+
+void startConnectingToWifi() {
+    WiFi.mode(WIFI_STA);
+    WiFi.config(IPAddress(192, 168, 20, 110),
+                IPAddress(192, 168, 20, 1),
+                IPAddress(255, 255, 255, 0),
+                IPAddress(192, 168, 20, 1),
+                IPAddress(192, 168, 20, 1));
+
+    WiFi.begin(SSID, WiFiPassword);
+    debugln("Connecting to " + String(SSID));
+}
+
+void initSensor() {
+
+    bbi2c.bWire = 0;
+    bbi2c.iSDA = 13;
+    bbi2c.iSCL = 14;
+
+    debugln("Init i2c...");
+    I2CInit(&bbi2c, 100000);
+
+    uint8_t data_request[2];
+    data_request[0] = 0x00;
+    data_request[1] = 0x06;
+    int ret = I2CWrite(&bbi2c, SENSOR_ADDR, data_request, 2);
+    if (ret) {
+        debugln("Sensor reset successful.")
+    } else {
+        debugln("Sensor reset unsuccessful.")
+    }
+}
+
+void startReadDataFromSensor() {
+    uint8_t data_request[2];
+    data_request[0] = 0x2C;
+    data_request[1] = 0x06;
+    int ret = I2CWrite(&bbi2c, SENSOR_ADDR, data_request, 2);
+    if (ret == 0) {
+        debugln("Failure to send, NACK received.");
+    }
+}
+
+void readDataFromSensor() {
+    uint8_t data_return[6];
+    data_return[0] = 1;
+    data_return[1] = 1;
+    int ret = I2CRead(&bbi2c, SENSOR_ADDR, data_return, 6);
+    if (ret != 1) {
+        debugln("Read error: " + String(ret));
+        temperature = -1;
+        humidity = -1;
+        return;
+    }
+
+    temperature = (((((float) data_return[0] * 256.0f) + (float) data_return[1]) * 175.0f) / 65535.0f) - 45.0f;
+    debug("Temp: " + String(temperature) + " ");
+
+    humidity = (((((float) data_return[3] * 256.0f) + (float) data_return[4]) * 100.0f) / 65535.0f);
+    debugln(humidity);
+}
+
+void sendDataToServer() {
+    esp_http_client_config_t config_disabled = {
+            .host = "iocaste.koala.haus",
+            .port = 8888,
+            .path = "/",
+            .query = ("temperature=" + String(temperature) + ",humidity=" + String(humidity)).c_str(),
+    };
+    unsigned long diff = millis() - startupTime;
+    String url = "http://iocaste.koala.haus:8888/?temperature=" + String(temperature) + ",humidity=" + String(humidity) + ",wake_time=" + String(diff);
+    debugln("Using url " + url)
+    esp_http_client_config_t config = {
+            .url = url.c_str()
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_err_t err = esp_http_client_perform(client);
+
+    if(err == ESP_OK) {
+        debugln("Send successfully, status = "
+            + String(esp_http_client_get_status_code(client)) + ", content_length = "
+            + String(esp_http_client_get_content_length(client)))
+    }
+    esp_http_client_cleanup(client);
+}
+
+void waitForWifi() {
+    uint8_t i = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+        debug(".");
+        delay(200);
+
+        if ((++i % 64) == 0) {
+            debugln(" still trying to connect - Taking too long, going to sleep.");
+            doDeepSleep();
+        }
+    }
+
+    debug("Connected. My IP address is: ");
+    debugln(WiFi.localIP());
+}
+
+void doDeepSleep() {
+    debugln("Disconnecting...")
+    WiFi.disconnect(true, false);
+    debugln("Sleeping...")
+    esp_deep_sleep(SLEEP_SECONDS * 1000000);
+}
+
+void loop() {
+    startConnectingToWifi();
+    initSensor();
+    startReadDataFromSensor();
+
+    delay(500); // wait until measurement is taken
+
+    readDataFromSensor();
+    if(temperature == -1 || humidity == -1) {
+        debugln("No new data - sleeping...")
+        doDeepSleep();
+    }
+
+    waitForWifi();
+
+    sendDataToServer();
+
+    // sleep
+    doDeepSleep();
+}
